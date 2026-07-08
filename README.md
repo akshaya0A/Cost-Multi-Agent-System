@@ -37,25 +37,94 @@ standard library. The `anthropic` package enables the LLM layer.
 
 ## Architecture
 
+```mermaid
+flowchart TB
+    subgraph ingest["Ingestion"]
+        traffic["LLM API traffic<br/>(all apps in the org)"]
+        gw["Gateway proxy / SDK middleware<br/><i>demo: synthetic generator</i>"]
+        traffic --> gw
+    end
+
+    gw --> store[("UsageStore — SQLite<br/>api_calls: tokens, cache stats, cost,<br/>latency, retries, stop_reason, ...")]
+
+    subgraph team["Agent team (deterministic analytics)"]
+        direction TB
+        ca["cost-analyst<br/>spend attribution"]
+        um["usage-monitor<br/>anomaly detection"]
+        ma["model-advisor<br/>model right-sizing"]
+        cs["cache-strategist<br/>prompt-cache opportunities"]
+        po["prompt-optimizer<br/>prompt bloat"]
+        wd["waste-detector<br/>retries, truncation, batching"]
+        fc["forecaster<br/>spend projection + budget"]
+    end
+
+    store --> team
+
+    orch["Orchestrator<br/>collects structured Findings<br/>(severity, $/month, recommendation, data)"]
+    team --> orch
+
+    pe["policy-engine<br/>ranks by savings, enforces guardrails,<br/>emits waved action plan<br/>(auto-apply vs human-review)"]
+    orch --> pe
+
+    subgraph outputs["Outputs"]
+        report["CLI report / JSON export<br/>(zero dependencies)"]
+        llm["Claude Opus 4.8 layer (optional)<br/>streamed exec summaries +<br/>tool-use Q&A over the store"]
+    end
+
+    pe --> report
+    pe --> llm
+    store -. "query_usage tool (read-only SQL)" .-> llm
 ```
-                       ┌──────────────────────────────────────────┐
-   LLM API traffic ───▶│  UsageStore (SQLite)                     │
-   (gateway/middleware │  api_calls: tokens, cache stats, cost,   │
-    writes call logs)  │  latency, retries, stop_reason, ...      │
-                       └───────────────┬──────────────────────────┘
-                                       │
-                       ┌───────────────▼──────────────────────────┐
-                       │  Orchestrator                            │
-                       │  runs 7 analyst agents → Findings        │
-                       │  policy-engine consumes all findings     │
-                       │  → ranked, guardrailed action plan       │
-                       └───────┬──────────────────┬───────────────┘
-                               │                  │
-                     deterministic report   Claude Opus 4.8 layer (optional)
-                     (JSON / CLI, no deps)  • streamed executive summaries
-                                            • tool-use Q&A over the store
-                                            • prompt caching on the system prompt
-```
+
+## How the system works
+
+A run is a five-stage pipeline. In the demo every stage executes in one
+command (`python -m tokenops demo`); in production stages 1 and 2–5 run on
+independent schedules.
+
+**1. Ingestion.** Every LLM API call the org makes is logged to the
+`api_calls` table — model, input/output/cache tokens, latency, retry linkage,
+stop reason, prompt-prefix hash, and the computed cost from
+[pricing.py](tokenops/pricing.py)'s catalog (current per-MTok prices, the
+~0.1x cache-read and 1.25x cache-write multipliers, the 50% batch discount).
+The demo seeds ~195k calls over 30 days with realistic inefficiencies planted
+(an uncached 12k-token RAG prefix, classifications on Opus, a retry storm, an
+eval-sweep cost spike, truncated outputs, batch-eligible offline traffic).
+
+**2. Analysis.** The orchestrator runs seven analyst agents against the
+store. Each agent is a pure function of the data — SQL aggregation plus
+pricing math, no LLM in the loop — so every number it produces is auditable
+and reproducible. Examples: the cache-strategist finds prompt prefixes ≥1,024
+tokens (the minimum cacheable size) that repeat with zero cache reads and
+prices out what a `cache_control` breakpoint would save; the usage-monitor
+z-scores each app's daily spend against its own baseline and flags ≥3σ days;
+the forecaster fits a least-squares trend to daily spend and projects 30 days
+forward against the budget.
+
+**3. Findings.** Agents emit `Finding` objects — a severity
+(critical/warning/info), an estimated monthly savings figure, a plain-English
+detail and recommendation, and the underlying data. Findings are the system's
+common currency: the CLI renders them, `export` serializes them for
+dashboards, and the LLM layer reasons over them.
+
+**4. Policy.** The policy-engine consumes every other agent's findings and
+turns them into an execution plan: actions ranked by savings, classified
+auto-apply (caching, batching, retry config — near-zero risk) vs human-review
+(model changes), batched into waves of at most three concurrent changes so
+regressions stay attributable. Guardrail: apps marked quality-sensitive are
+never auto-downgraded — the model-advisor routes those as eval-gated
+recommendations with $0 claimed savings until the eval passes.
+
+**5. Reasoning (optional).** With Anthropic credentials present, Claude
+Opus 4.8 sits on top as the team's lead analyst: it streams an executive
+summary of the findings, and `tokenops ask "..."` gives it a `query_usage`
+tool — a read-only SQL interface to the store — so it can investigate
+questions the pre-computed findings don't answer (per-day breakdowns, "what
+changed on the 2nd?"). The stable system prompt carries a prompt-caching
+breakpoint, so repeated questions in a session bill the prefix at ~10% price.
+The division of labor is strict: the deterministic layer computes the
+numbers; Claude explains, prioritizes, and answers follow-ups grounded in
+them.
 
 **Design principles**
 
